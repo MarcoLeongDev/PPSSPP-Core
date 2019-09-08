@@ -24,35 +24,160 @@
  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <atomic>
+#include <thread>
+#include "thread/threadutil.h"
+
 #include "base/logging.h"
 #include "base/NativeApp.h"
 
+#include "math/fast/fast_math.h"
+
 #include "Common/LogManager.h"
 
+#include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "Core/Host.h"
 #include "Core/System.h"
+#include "Core/HLE/__sceAudio.h"
 
 #include "file/vfs.h"
 #include "file/zip_read.h"
 
-#include "gfx/gl_lost_manager.h"
+#include "gfx/OpenEmuGLContext.h"
+#include "gfx/gl_common.h"
+#include "thin3d/DataFormat.h"
 
-#include "gfx_es2/fbo.h"
-#include "gfx_es2/gl_state.h"
+#include "Common/GraphicsContext.h"
+#include "GPU/GPUState.h"
 
 #include "GPU/GPUState.h"
+#include "GPU/GPUInterface.h"
+#include "GPU/Common/FramebufferCommon.h"
+#include "GPU/Common/TextureScalerCommon.h"
+
+#include "DataFormatGL.h"
 
 #include "input/input_state.h"
 
 #include "UI/OnScreenDisplay.h"
 
-InputState input_state;
+KeyInput input_state;
 OnScreenMessages osm;
+
+namespace OpenEmuCoreThread {
+    OpenEmuGLContext *ctx;
+    
+    enum class EmuThreadState {
+        DISABLED,
+        START_REQUESTED,
+        RUNNING,
+        PAUSE_REQUESTED,
+        PAUSED,
+        QUIT_REQUESTED,
+        STOPPED,
+    };
+    
+    static std::thread emuThread;
+    static bool threadStarted = false;
+    static std::atomic<EmuThreadState> emuThreadState(EmuThreadState::DISABLED);
+    
+    static void EmuFrame() {
+        ctx->SetRenderTarget();
+        
+        if (ctx->GetDrawContext()) {
+            ctx->GetDrawContext()->BeginFrame();
+        }
+        
+        gpu->BeginHostFrame();
+        
+        coreState = CORE_RUNNING;
+        PSP_RunLoopUntil(UINT64_MAX);
+        
+        gpu->EndHostFrame();
+        
+        if (ctx->GetDrawContext()) {
+            ctx->GetDrawContext()->EndFrame();
+        }
+    }
+    
+    static void EmuThreadFunc() {
+        setCurrentThreadName("Emu");
+        
+        while (true) {
+            switch ((EmuThreadState)emuThreadState) {
+                case EmuThreadState::START_REQUESTED:
+                    threadStarted = true;
+                    emuThreadState = EmuThreadState::RUNNING;
+                    /* fallthrough */
+                case EmuThreadState::RUNNING:
+                    EmuFrame();
+                    break;
+                case EmuThreadState::PAUSE_REQUESTED:
+                    emuThreadState = EmuThreadState::PAUSED;
+                    /* fallthrough */
+                case EmuThreadState::PAUSED:
+                    usleep(1000);
+                    break;
+                default:
+                case EmuThreadState::QUIT_REQUESTED:
+                    emuThreadState = EmuThreadState::STOPPED;
+                    ctx->StopThread();
+                    return;
+            }
+        }
+    }
+    
+    void EmuThreadStart() {
+        bool wasPaused = emuThreadState == EmuThreadState::PAUSED;
+        emuThreadState = EmuThreadState::START_REQUESTED;
+        
+        if (!wasPaused) {
+            ctx->ThreadStart();
+            emuThread = std::thread(&EmuThreadFunc);
+        }
+    }
+    
+    void EmuThreadStop() {
+        if (emuThreadState != EmuThreadState::RUNNING) {
+            return;
+        }
+        
+        emuThreadState = EmuThreadState::QUIT_REQUESTED;
+        
+        while (ctx->ThreadFrame()) {
+            // Need to keep eating frames to allow the EmuThread to exit correctly.
+            continue;
+        }
+        emuThread.join();
+        emuThread = std::thread();
+        ctx->ThreadEnd();
+    }
+    
+    void EmuThreadPause() {
+        if (emuThreadState != EmuThreadState::RUNNING) {
+            return;
+        }
+        emuThreadState = EmuThreadState::PAUSE_REQUESTED;
+        
+        while (emuThreadState != EmuThreadState::PAUSED) {
+            //We need to process frames until the thread Pauses give 10 ms between loops
+            ctx->ThreadFrame();
+            emuThreadState = EmuThreadState::PAUSE_REQUESTED;
+            usleep(10000);
+        }
+    }
+}  // namespace OpenEmuCoreThread
+
+
+// Here's where we store the OpenEmu framebuffer to bind for final rendering
+int framebuffer = 0;
 
 class AndroidLogger : public LogListener
 {
 public:
+    void Log(const LogMessage &msg) override{};
+
 	void Log(LogTypes::LOG_LEVELS level, const char *msg)
 	{
 		switch (level)
@@ -78,67 +203,54 @@ public:
 
 static AndroidLogger *logger = 0;
 
-class NativeHost : public Host
-{
+class NativeHost : public Host {
 public:
-	NativeHost()
-    {
-		// hasRendered = false;
-	}
+    NativeHost() {
+    }
 
-	virtual void UpdateUI() {}
+    void UpdateUI() override {}
 
-	virtual void UpdateMemView() {}
-	virtual void UpdateDisassembly() {}
+    void UpdateMemView() override {}
+    void UpdateDisassembly() override {}
 
-	virtual void SetDebugMode(bool mode) {}
+    void SetDebugMode(bool mode) override { }
 
-	virtual bool InitGL(std::string *error_message) { return true; }
-	virtual void ShutdownGL() {}
+    bool InitGraphics(std::string *error_string, GraphicsContext **ctx)override { return true; }
+    void ShutdownGraphics() override {}
 
-	virtual void InitSound(PMixer *mixer);
-	virtual void UpdateSound() {}
-	virtual void ShutdownSound();
+    void InitSound() override {}
+    void UpdateSound() override {}
+    void ShutdownSound() override {}
 
-	// this is sent from EMU thread! Make sure that Host handles it properly!
-	virtual void BootDone() {}
+    // this is sent from EMU thread! Make sure that Host handles it properly!
+    void BootDone() override {}
 
-	virtual bool IsDebuggingEnabled() { return false; }
-	virtual bool AttemptLoadSymbolMap() { return false; }
-	virtual void ResetSymbolMap() {}
-	virtual void AddSymbol(std::string name, u32 addr, u32 size, int type=0) {}
-	virtual void SetWindowTitle(const char *message) {}
+    bool IsDebuggingEnabled() override {return false;}
+    bool AttemptLoadSymbolMap() override {return false;}
+    void SetWindowTitle(const char *message) override {}
 };
-
-static PMixer *g_mixer = 0;
-
-void NativeHost::InitSound(PMixer *mixer)
-{
-    g_mixer = mixer;
-}
-
-void NativeHost::ShutdownSound()
-{
-    g_mixer = 0;
-}
 
 int NativeMix(short *audio, int num_samples)
 {
-	if(g_mixer)
-		num_samples = g_mixer->Mix(audio, num_samples);
-    else
-		memset(audio, 0, num_samples * 2 * sizeof(short));
+    int sample_rate = System_GetPropertyInt(SYSPROP_AUDIO_SAMPLE_RATE);
+    num_samples = __AudioMix(audio, num_samples, sample_rate > 0 ? sample_rate : 44100);
 
 	return num_samples;
 }
 
-void NativeInit(int argc, const char *argv[], const char *savegame_directory, const char *external_directory, const char *installID)
+void NativeInit(int argc, const char *argv[], const char *savegame_directory, const char *external_directory, const char *cache_directory)
 {
-    host = new NativeHost;
+    VFSRegister("", new DirectoryAssetReader("assets/"));
+    VFSRegister("", new DirectoryAssetReader(external_directory));
+    
+    if (host == nullptr) {
+        host = new NativeHost();
+    }
 
+    g_Config.externalDirectory = external_directory;
+    
     logger = new AndroidLogger();
 
-	LogManager::Init();
 	LogManager *logman = LogManager::GetInstance();
 	ILOG("Logman: %p", logman);
 
@@ -148,45 +260,49 @@ void NativeInit(int argc, const char *argv[], const char *savegame_directory, co
 		LogTypes::LOG_TYPE type = (LogTypes::LOG_TYPE)i;
         logman->SetLogLevel(type, logLevel);
     }
-
-    VFSRegister("", new DirectoryAssetReader(external_directory));
 }
 
-void NativeInitGraphics()
-{
-    // Save framebuffer to later be bound again
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &framebuffer);
+void NativeSetThreadState(OpenEmuCoreThread::EmuThreadState threadState)  {
+    if(threadState == OpenEmuCoreThread::EmuThreadState::PAUSE_REQUESTED && OpenEmuCoreThread::threadStarted)
+        OpenEmuCoreThread::EmuThreadPause();
+    else if(threadState == OpenEmuCoreThread::EmuThreadState::START_REQUESTED && !OpenEmuCoreThread::threadStarted)
+        OpenEmuCoreThread::EmuThreadStart();
+    else
+        OpenEmuCoreThread::emuThreadState = threadState;
+}
 
-    gl_lost_manager_init();
+bool NativeInitGraphics(GraphicsContext *graphicsContext)
+{
+    //Set the Core Thread graphics Context
+    OpenEmuCoreThread::ctx = static_cast<OpenEmuGLContext*>(graphicsContext);
+    
+    // Save framebuffer and set ppsspp default graphics framebuffer object
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING_EXT, &framebuffer);
+    OpenEmuCoreThread::ctx->SetRenderFBO(framebuffer);
+ 
+    Core_SetGraphicsContext(OpenEmuCoreThread::ctx);
+    
+    if (gpu)
+        gpu->DeviceRestore();
+    
+    return true;
 }
 
 void NativeResized(){}
 
-void NativeRender()
+void NativeRender(GraphicsContext *ctx)
 {
-	glstate.Restore();
-
-    ReapplyGfxState();
-
-    s64 blockTicks = usToCycles(1000000 / 10);
-    while(coreState == CORE_RUNNING)
-    {
-		PSP_RunLoopFor((int)blockTicks);
-	}
-
-	// Hopefully coreState is now CORE_NEXTFRAME
-	if(coreState == CORE_NEXTFRAME)
-    {
-		// set back to running for the next frame
-		coreState = CORE_RUNNING;
-    }
+    if(OpenEmuCoreThread::emuThreadState == OpenEmuCoreThread::EmuThreadState::PAUSED)
+        return;
+    
+    OpenEmuCoreThread::ctx->ThreadFrame();
+    OpenEmuCoreThread::ctx->SwapBuffers();
 }
 
-void NativeUpdate(InputState &input) {}
+void NativeUpdate() {}
 
 void NativeShutdownGraphics()
 {
-    gl_lost_manager_shutdown();
 }
 
 void NativeShutdown()
@@ -197,7 +313,7 @@ void NativeShutdown()
     LogManager::Shutdown();
 }
 
-void OnScreenMessages::Show(const std::string &message, float duration_s, uint32_t color, int icon, bool checkUnique) {}
+void OnScreenMessages::Show(const std::string &text, float duration_s, uint32_t color, int icon, bool checkUnique, const char *id) {}
 
 std::string System_GetProperty(SystemProperty prop) {
 	switch (prop) {
@@ -210,3 +326,15 @@ std::string System_GetProperty(SystemProperty prop) {
 	}
 }
 
+int System_GetPropertyInt(SystemProperty prop) {
+    switch (prop) {
+        case SYSPROP_AUDIO_SAMPLE_RATE:
+            return 44100;
+        case SYSPROP_DISPLAY_REFRESH_RATE:
+            return 60000;
+        default:
+            return -1;
+    }
+}
+
+void System_SendMessage(const char *command, const char *parameter){}

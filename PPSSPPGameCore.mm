@@ -28,104 +28,136 @@
 #import <OpenEmuBase/OERingBuffer.h>
 #import <OpenGL/gl.h>
 
-#include "base/NativeApp.h"
+#include "gfx/OpenEmuGLContext.h"
 
+#include "base/NativeApp.h"
+#include "base/timeutil.h"
+
+#include "Core/Core.h"
 #include "Core/Config.h"
+#include "Core/ConfigValues.h"
 #include "Core/CoreParameter.h"
 #include "Core/CoreTiming.h"
 #include "Core/HLE/sceCtrl.h"
-#include "Core/HLE/sceDisplay.h"
 #include "Core/Host.h"
 #include "Core/SaveState.h"
 #include "Core/System.h"
 
-#define SAMPLERATE 44100
-#define SIZESOUNDBUFFER 44100 / 30 * 4
+#include "Common/GraphicsContext.h"
+#include "Common/LogManager.h"
 
-@interface PPSSPPGameCore () <OEPSPSystemResponderClient>
+#include "thin3d/thin3d_create.h"
+#include "thin3d/GLRenderManager.h"
+#include "thin3d/DataFormatGL.h"
+
+#define AUDIO_FREQ          44100
+#define AUDIO_CHANNELS      2
+#define AUDIO_SAMPLESIZE    sizeof(int16_t)
+
+
+
+namespace SaveState {
+    struct SaveStart {
+        void DoState(PointerWrap &p);
+    };
+} // namespace SaveState
+
+namespace OpenEmuCoreThread {
+    enum class EmuThreadState {
+        DISABLED,
+        START_REQUESTED,
+        RUNNING,
+        PAUSE_REQUESTED,
+        PAUSED,
+        QUIT_REQUESTED,
+        STOPPED,
+    };
+} //namespace OpenEmuThreadCore
+
+void NativeSetThreadState(OpenEmuCoreThread::EmuThreadState threadState);
+
+@interface PPSSPPGameCore () <OEPSPSystemResponderClient, OEAudioBuffer>
 {
-    uint16_t *_soundBuffer;
     CoreParameter _coreParam;
     bool _isInitialized;
     bool _shouldReset;
-    float _frameInterval;
+
+   OpenEmuGLContext *OEgraphicsContext;
 }
 @end
 
+PPSSPPGameCore *_current = 0;
+
 @implementation PPSSPPGameCore
 
-- (id)init
+
+- (instancetype)init
 {
-    self = [super init];
-
-    if(self)
-    {
-        _soundBuffer = (uint16_t *)malloc(SIZESOUNDBUFFER * sizeof(uint16_t));
-        memset(_soundBuffer, 0, SIZESOUNDBUFFER * sizeof(uint16_t));
-    }
-
+    (self = [super init]);
+    
+    _current = self;
+    
     return self;
 }
-
-- (void)dealloc
-{
-    free(_soundBuffer);
-}
-
 # pragma mark - Execution
 
 - (BOOL)loadFileAtPath:(NSString *)path error:(NSError **)error
 {
-    NSString *resourcePath = [[[self owner] bundle] resourcePath];
-    NSString *supportDirectoryPath = [self supportDirectoryPath];
+    NSURL *romURL = [NSURL fileURLWithPath:path];
+    NSURL *resourceURL = self.owner.bundle.resourceURL;
+    NSURL *supportDirectoryURL = [NSURL fileURLWithPath:self.supportDirectoryPath isDirectory:YES];
 
     // Copy over font files if needed
-    NSFileManager *fileManager = [NSFileManager defaultManager];
-    NSString *fontSourceDirectory = [resourcePath stringByAppendingString:@"/flash0/font/"];
-    NSString *fontDestinationDirectory = [supportDirectoryPath stringByAppendingString:@"/font/"];
-    NSArray *fontFiles = [fileManager contentsOfDirectoryAtPath:fontSourceDirectory error:nil];
-    for(NSString *font in fontFiles)
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    NSURL *fontSourceDirectory = [resourceURL URLByAppendingPathComponent:@"flash0/font" isDirectory:YES];
+    NSURL *fontDestinationDirectory = [supportDirectoryURL URLByAppendingPathComponent:@"font" isDirectory:YES];
+    NSArray *fontFiles = [fileManager contentsOfDirectoryAtURL:fontSourceDirectory includingPropertiesForKeys:@[NSURLNameKey] options:0 error:nil];
+    [fileManager createDirectoryAtURL:fontDestinationDirectory withIntermediateDirectories:YES attributes:nil error:nil];
+    for(NSURL *fontURL in fontFiles)
     {
-        NSString *fontSource = [fontSourceDirectory stringByAppendingString:font];
-        NSString *fontDestination = [fontDestinationDirectory stringByAppendingString:font];
+        NSURL *destinationFontURL = [fontDestinationDirectory URLByAppendingPathComponent:fontURL.lastPathComponent];
 
-        [fileManager copyItemAtPath:fontSource toPath:fontDestination error:nil];
+        [fileManager copyItemAtURL:fontURL toURL:destinationFontURL error:nil];
     }
+
+    LogManager::Init();
 
     g_Config.Load("");
 
-    NSString *directoryString      = [supportDirectoryPath stringByAppendingString:@"/"];
-    g_Config.currentDirectory      = [directoryString UTF8String];
-    g_Config.externalDirectory     = [directoryString UTF8String];
-    g_Config.memCardDirectory      = [directoryString UTF8String];
-    g_Config.flash0Directory       = [directoryString UTF8String];
-    g_Config.internalDataDirectory = [directoryString UTF8String];
-    g_Config.iShowFPSCounter       = true;
-    g_Config.bFrameSkipUnthrottle  = false;
-
-    _coreParam.cpuCore      = CPU_JIT;
-    _coreParam.gpuCore      = GPU_GLES;
+    // Force a trailing forward slash that PPSSPP requires
+    NSString *directoryString      = [supportDirectoryURL.path stringByAppendingString:@"/"];
+    //NSURL *directoryURL3            = [supportDirectoryURL URLByAppendingPathComponent:@"/" isDirectory:YES];
+    g_Config.currentDirectory      = directoryString.fileSystemRepresentation;
+    g_Config.externalDirectory     = directoryString.fileSystemRepresentation;
+    g_Config.memStickDirectory     = directoryString.fileSystemRepresentation;
+    g_Config.flash0Directory       = directoryString.fileSystemRepresentation;
+    g_Config.internalDataDirectory = directoryString.fileSystemRepresentation;
+    g_Config.iGPUBackend           = (int)GPUBackend::OPENGL;
+    g_Config.bHideStateWarnings    = false;
+    
+    _coreParam.cpuCore      = CPUCore::JIT;
+    _coreParam.gpuCore      = GPUCORE_GLES;
     _coreParam.enableSound  = true;
-    _coreParam.fileToStart  = [path UTF8String];
+    _coreParam.fileToStart  = romURL.fileSystemRepresentation;
     _coreParam.mountIso     = "";
-    _coreParam.startPaused  = false;
+    _coreParam.startBreak  = false;
     _coreParam.printfEmuLog = false;
     _coreParam.headLess     = false;
-    _coreParam.unthrottle   = true;
 
     _coreParam.renderWidth  = 480;
     _coreParam.renderHeight = 272;
     _coreParam.pixelWidth   = 480;
     _coreParam.pixelHeight  = 272;
 
-    return YES;
+    coreState = CORE_POWERUP;
+    
+    return true;
 }
 
 - (void)stopEmulation
 {
-    // We need a OpenGL context here, because PPSSPP cleans up framebuffers at this point
-    [[self renderDelegate] willRenderOnAlternateThread];
-    [[self renderDelegate] startRenderingOnAlternateThread];
+    NativeSetThreadState(OpenEmuCoreThread::EmuThreadState::PAUSE_REQUESTED);
+
     PSP_Shutdown();
 
     NativeShutdownGraphics();
@@ -143,15 +175,26 @@
 {
     if(!_isInitialized)
     {
-        // This is where PPSSPP will look for ppge_atlas.zim
-        NSString *resourcePath = [[[[self owner] bundle] resourcePath] stringByAppendingString:@"/"];
+        // This is where PPSSPP will look for ppge_atlas.zim, requires trailing forward slash
+        NSString *resourcePath = [self.owner.bundle.resourcePath stringByAppendingString:@"/"];
+
+        OEgraphicsContext = OpenEmuGLContext::CreateGraphicsContext();
         
-        NativeInit(0, nil, nil, [resourcePath UTF8String], nil);
-        NativeInitGraphics();
+        NativeInit(0, nil, nil, resourcePath.fileSystemRepresentation, nil);
+
+        OEgraphicsContext->InitFromRenderThread(nullptr);
+        
+        _coreParam.graphicsContext = OEgraphicsContext;
+        _coreParam.thin3d = OEgraphicsContext ? OEgraphicsContext->GetDrawContext() : nullptr;
+       
+        NativeInitGraphics(OEgraphicsContext);
     }
 
     if(_shouldReset)
+    {
+        NativeSetThreadState(OpenEmuCoreThread::EmuThreadState::PAUSE_REQUESTED);
         PSP_Shutdown();
+    }
 
     if(!_isInitialized || _shouldReset)
     {
@@ -160,29 +203,27 @@
 
         std::string error_string;
         if(!PSP_Init(_coreParam, &error_string))
-            NSLog(@"ERROR: %s", error_string.c_str());
+            NSLog(@"[PPSSPP] ERROR: %s", error_string.c_str());
 
         host->BootDone();
 		host->UpdateDisassembly();
+        
+        //Start the Emulator Thread
+        NativeSetThreadState(OpenEmuCoreThread::EmuThreadState::START_REQUESTED);
+        
+    } else {
+        //If Fast forward rate is detected, unthrottle the rndering
+        PSP_CoreParameter().unthrottle = (self.rate > 1) ? true : false;
+
+        //Let PPSSPP Core run a loop and return
+        UpdateRunLoop();
     }
-
-    NativeRender();
-    glFlushRenderAPPLE();
-
-    float vps, fps;
-    __DisplayGetFPS(&vps, &_frameInterval, &fps);
-    
-    if(_frameInterval <= 0) _frameInterval = 60;
-
-    int samplesWritten = NativeMix((short *)_soundBuffer, SAMPLERATE / _frameInterval);
-    [[self ringBufferAtIndex:0] write:_soundBuffer maxLength:sizeof(uint16_t) * samplesWritten * 2];
 }
-
 # pragma mark - Video
 
-- (BOOL)rendersToOpenGL
+- (OEGameCoreRendering)gameCoreRendering
 {
-    return YES;
+    return OEGameCoreRenderingOpenGL2Video;
 }
 
 - (OEIntSize)bufferSize
@@ -197,41 +238,91 @@
 
 - (NSTimeInterval)frameInterval
 {
-    return _frameInterval ?: 60;
+    return 59.94;
 }
 
 # pragma mark - Audio
 
 - (NSUInteger)channelCount
 {
-    return 2;
+    return AUDIO_CHANNELS;
 }
 
 - (double)audioSampleRate
 {
-    return SAMPLERATE;
+    return AUDIO_FREQ;
+}
+
+- (id<OEAudioBuffer>)audioBufferAtIndex:(NSUInteger)index
+{
+    return self;
+}
+
+- (NSUInteger)read:(void *)buffer maxLength:(NSUInteger)len
+{
+    NativeMix((short *)buffer, (int)(len / (AUDIO_CHANNELS * sizeof(uint16_t))));
+    return len;
+}
+
+- (NSUInteger)write:(const void *)buffer maxLength:(NSUInteger)length
+{
+    return 0;
+}
+
+- (NSUInteger)length
+{
+    return AUDIO_FREQ / 15;
 }
 
 # pragma mark - Save States
 
-static void _OESaveStateCallback(bool status, void *cbUserData)
+static void _OESaveStateCallback(SaveState::Status status, std::string message, void *cbUserData)
 {
     void (^block)(BOOL, NSError *) = (__bridge_transfer void(^)(BOOL, NSError *))cbUserData;
+
+    [_current endPausedExecution];
     
-    block(status, nil);
+    block((status != SaveState::Status::FAILURE), nil);
+}
+
+static void _OELoadStateCallback(SaveState::Status status, std::string message, void *cbUserData)
+{
+    void (^block)(BOOL, NSError *) = (__bridge_transfer void(^)(BOOL, NSError *))cbUserData;
+
+    //Unpause the EmuThread by requesting it to start again
+    NativeSetThreadState(OpenEmuCoreThread::EmuThreadState::START_REQUESTED);
+    NSError *error = nil;
+        
+    if(status == SaveState::Status::WARNING) {
+        error = [NSError errorWithDomain:OEGameCoreErrorDomain code:OEGameCoreCouldNotLoadStateError userInfo:@{
+            NSLocalizedDescriptionKey : NSLocalizedString(@"PPSSPP Save State Warning", @"PPSSPP Save State Warning description."),
+            NSLocalizedRecoverySuggestionErrorKey : [NSString stringWithFormat:NSLocalizedString(@"This save state was created from a previous version of PPSSPP, or simulates over 4 hours of time played.\n\nSave states preserve bugs from old PPSSPP versions and states from long sessions can also expose bugs rarely seen on a real PSP.\n\nIt is recommended to \"clean load\" for less bugs:\n\n1. Save in-game (memory stick, not save state), then stop emulation.\n2. Go to OpenEmu > Preferences > Library, click \"Reset warnings\".\n3. Reopen your game and click \"No\" when prompted to \"Continue where you left off\".", @"PPSSPP Save State Warning.")]
+        }];
+    } else if(status == SaveState::Status::FAILURE) {
+        error = [NSError errorWithDomain:OEGameCoreErrorDomain code:OEGameCoreCouldNotLoadStateError userInfo:@{
+            NSLocalizedDescriptionKey : NSLocalizedString(@"The Save State failed to Load", @"PPSSPP Save State Failure description."),
+            NSLocalizedRecoverySuggestionErrorKey : [NSString stringWithFormat:NSLocalizedString(@"Could not load Save State.", @"PPSSPP Save State Failure.")]
+        }];
+    }
+    
+    block((status == SaveState::Status::SUCCESS), error);
 }
 
 - (void)saveStateToFileAtPath:(NSString *)fileName completionHandler:(void (^)(BOOL, NSError *))block
 {
-    SaveState::Save([fileName UTF8String], _OESaveStateCallback, (__bridge_retained void *)[block copy]);
-    if(_isInitialized) SaveState::Process();
+    [self beginPausedExecution];
+    SaveState::Save(fileName.fileSystemRepresentation, _OESaveStateCallback, (__bridge_retained void *)[block copy]);
 }
-
 
 - (void)loadStateFromFileAtPath:(NSString *)fileName completionHandler:(void (^)(BOOL, NSError *))block
 {
-    SaveState::Load([fileName UTF8String], _OESaveStateCallback, (__bridge_retained void *)[block copy]);
-    if(_isInitialized) SaveState::Process();
+    SaveState::Load(fileName.fileSystemRepresentation, _OELoadStateCallback, (__bridge_retained void *)[block copy]);
+    if(_isInitialized){
+        //We need to pause our EmuThread so we don't try to process the save state in the middle of a Frame Render
+        NativeSetThreadState(OpenEmuCoreThread::EmuThreadState::PAUSE_REQUESTED);
+
+        SaveState::Process();
+    }
 }
 
 # pragma mark - Input
@@ -246,7 +337,7 @@ const int buttonMap[] = { CTRL_UP, CTRL_DOWN, CTRL_LEFT, CTRL_RIGHT, 0, 0, 0, 0,
         __CtrlSetAnalogX(button == OEPSPAnalogRight ? value : -value);
 }
 
--(oneway void)didPushPSPButton:(OEPSPButton)button forPlayer:(NSUInteger)player
+- (oneway void)didPushPSPButton:(OEPSPButton)button forPlayer:(NSUInteger)player
 {
     __CtrlButtonDown(buttonMap[button]);
 }
